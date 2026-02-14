@@ -158,6 +158,22 @@ python scripts/train_nifi.py \
   --exp runs/nifi_tiny
 ```
 
+### Single GPU (RTX 3090, 24GB) runtime
+
+- `configs/default.yaml` now includes a `runtime` block for GPU behavior:
+  - `device: cuda`, `device_id: 0`
+  - `mixed_precision: fp16`
+  - `allow_tf32: true`, `cudnn_benchmark: true`
+  - pinned/non-blocking dataloader transfer enabled
+- To force one GPU explicitly:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/train_nifi.py \
+  --config configs/default.yaml \
+  --data_root pairs/ \
+  --exp runs/nifi_3090
+```
+
 ### Smoke test (requested minimal verification path)
 
 ```bash
@@ -208,6 +224,7 @@ python scripts/eval_nifi.py --ckpt runs/nifi_tiny/best.pt --data_root pairs/ --s
 - deterministic seeds (`nifi/utils/seed.py`)
 - checkpoint save/resume (`nifi/utils/checkpoint.py`)
 - fp16/bf16 autocast support
+- optimized single-GPU runtime controls (`runtime` block in `configs/default.yaml`)
 - gradient clipping
 - NaN/Inf checks + tensor shape checks
 - tiny overfit sanity guard (start/end loss trend)

@@ -21,6 +21,7 @@ from nifi.metrics import PerceptualMetrics, aggregate_scene_metrics
 from nifi.utils.checkpoint import load_checkpoint
 from nifi.utils.config import load_config
 from nifi.utils.logging import get_logger
+from nifi.utils.runtime import configure_runtime, get_runtime_defaults, resolve_device
 from nifi.utils.seed import set_seed
 
 
@@ -85,9 +86,23 @@ def main() -> None:
     else:
         raise ValueError("Could not find config in checkpoint. Pass --config explicitly.")
 
-    set_seed(int(cfg.get("seed", 42)))
+    runtime_cfg = get_runtime_defaults()
+    runtime_cfg.update(cfg.get("runtime", {}))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_seed(int(cfg.get("seed", 42)), deterministic=bool(runtime_cfg.get("deterministic", False)))
+    configure_runtime(runtime_cfg)
+    device = resolve_device(runtime_cfg)
+    non_blocking = bool(runtime_cfg.get("non_blocking", True))
+
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        logger.info(
+            "Using GPU: %s | VRAM %.1f GB | CUDA %s",
+            props.name,
+            props.total_memory / (1024 ** 3),
+            torch.version.cuda,
+        )
+
     mp = cfg["train"].get("mixed_precision", "fp16")
     amp_dtype = torch.bfloat16 if mp == "bf16" else torch.float16
     use_amp = device.type == "cuda" and mp in {"bf16", "fp16"}
@@ -118,6 +133,9 @@ def main() -> None:
         shuffle=False,
         max_samples=args.max_samples,
         allowed_rates=cfg.get("rates", None),
+        pin_memory=bool(runtime_cfg.get("pin_memory", True)),
+        persistent_workers=bool(runtime_cfg.get("persistent_workers", True)),
+        prefetch_factor=int(runtime_cfg.get("prefetch_factor", 4)),
     )
 
     metrics = PerceptualMetrics(device=device)
@@ -132,8 +150,8 @@ def main() -> None:
         restored_dir.mkdir(parents=True, exist_ok=True)
 
     for batch in tqdm(dl, desc="eval"):
-        clean = batch["clean"].to(device)
-        degraded = batch["degraded"].to(device)
+        clean = batch["clean"].to(device, non_blocking=non_blocking)
+        degraded = batch["degraded"].to(device, non_blocking=non_blocking)
         prompts = list(batch["prompt"])
         scenes = list(batch["scene"])
         rates = list(batch["rate"])

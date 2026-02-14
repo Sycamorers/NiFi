@@ -14,6 +14,9 @@ def build_paired_dataloader(
     shuffle: bool,
     max_samples: Optional[int] = None,
     allowed_rates: Optional[List[str]] = None,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 2,
 ) -> DataLoader:
     ds = PairedImageDataset(
         data_root=data_root,
@@ -23,11 +26,15 @@ def build_paired_dataloader(
         allowed_rates=allowed_rates,
     )
 
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=shuffle,
-    )
+    kwargs = {
+        "dataset": ds,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "drop_last": shuffle,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = persistent_workers
+        kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(**kwargs)

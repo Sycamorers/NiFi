@@ -24,6 +24,7 @@ from nifi.metrics import PerceptualMetrics
 from nifi.utils.checkpoint import load_checkpoint, save_checkpoint
 from nifi.utils.config import load_config
 from nifi.utils.logging import CSVLogger, dump_json, get_logger
+from nifi.utils.runtime import configure_runtime, get_runtime_defaults, resolve_device
 from nifi.utils.sanity import assert_no_nan, assert_shape, tiny_overfit_guard
 from nifi.utils.seed import set_seed
 
@@ -83,12 +84,14 @@ def restore_latents_one_step(
 def evaluate(
     model: FrozenLDMWithNiFiAdapters,
     val_loader,
+    metrics: PerceptualMetrics,
     device: torch.device,
     t0: int,
+    non_blocking: bool,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
     max_batches: int = None,
 ) -> Dict[str, float]:
-    metrics = PerceptualMetrics(device=device)
-
     lpips_before = []
     lpips_after = []
     dists_before = []
@@ -99,11 +102,11 @@ def evaluate(
         if max_batches is not None and i >= max_batches:
             break
 
-        clean = batch["clean"].to(device)
-        degraded = batch["degraded"].to(device)
+        clean = batch["clean"].to(device, non_blocking=non_blocking)
+        degraded = batch["degraded"].to(device, non_blocking=non_blocking)
         prompts = list(batch["prompt"])
 
-        with torch.no_grad():
+        with torch.no_grad(), autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             z_deg = model.encode_images(degraded)
             z_hat = restore_latents_one_step(model, z_deg, prompts, t0=t0, stochastic=False)
             restored = model.decode_latents(z_hat)
@@ -138,9 +141,25 @@ def main() -> None:
     logger = get_logger("nifi.train")
     csv_logger = CSVLogger(exp_dir / "train_log.csv")
 
-    set_seed(int(cfg.get("seed", 42)))
+    runtime_cfg = get_runtime_defaults()
+    runtime_cfg.update(cfg.get("runtime", {}))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_seed(int(cfg.get("seed", 42)), deterministic=bool(runtime_cfg.get("deterministic", False)))
+    configure_runtime(runtime_cfg)
+    device = resolve_device(runtime_cfg)
+
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        logger.info(
+            "Using GPU: %s | VRAM %.1f GB | CUDA %s",
+            props.name,
+            props.total_memory / (1024 ** 3),
+            torch.version.cuda,
+        )
+    else:
+        logger.info("Using CPU runtime")
+
+    non_blocking = bool(runtime_cfg.get("non_blocking", True))
     train_cfg = cfg["train"]
     loss_w = cfg["loss_weights"]
 
@@ -172,6 +191,9 @@ def main() -> None:
         shuffle=True,
         max_samples=train_cfg.get("max_train_samples"),
         allowed_rates=rates,
+        pin_memory=bool(runtime_cfg.get("pin_memory", True)),
+        persistent_workers=bool(runtime_cfg.get("persistent_workers", True)),
+        prefetch_factor=int(runtime_cfg.get("prefetch_factor", 4)),
     )
 
     val_loader = build_paired_dataloader(
@@ -183,6 +205,9 @@ def main() -> None:
         shuffle=False,
         max_samples=train_cfg.get("max_eval_samples"),
         allowed_rates=rates,
+        pin_memory=bool(runtime_cfg.get("pin_memory", True)),
+        persistent_workers=bool(runtime_cfg.get("persistent_workers", True)),
+        prefetch_factor=int(runtime_cfg.get("prefetch_factor", 4)),
     )
 
     model_cfg = DiffusionConfig(
@@ -201,6 +226,7 @@ def main() -> None:
     rec_losses.eval()
     for p in rec_losses.parameters():
         p.requires_grad_(False)
+    eval_metrics = PerceptualMetrics(device=device)
 
     opt_minus = torch.optim.AdamW(
         model.adapter_parameters("minus"),
@@ -250,8 +276,8 @@ def main() -> None:
     pbar = tqdm(range(start_step, n_steps + 1), desc="train")
     for step in pbar:
         batch = next(train_iter)
-        clean = batch["clean"].to(device)
-        degraded = batch["degraded"].to(device)
+        clean = batch["clean"].to(device, non_blocking=non_blocking)
+        degraded = batch["degraded"].to(device, non_blocking=non_blocking)
         prompts = list(batch["prompt"])
 
         assert_shape("clean", clean, 4)
@@ -361,8 +387,20 @@ def main() -> None:
             logger.info("step=%d loss_minus=%.5f loss_plus=%.5f", step, row["loss_minus"], row["loss_plus"])
 
         if step % eval_every == 0 or step == n_steps:
+            if device.type == "cuda" and bool(runtime_cfg.get("empty_cache_before_eval", False)):
+                torch.cuda.empty_cache()
             t_start = time.time()
-            val = evaluate(model, val_loader, device=device, t0=t0, max_batches=10 if args.smoke_test else None)
+            val = evaluate(
+                model,
+                val_loader,
+                metrics=eval_metrics,
+                device=device,
+                t0=t0,
+                non_blocking=non_blocking,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                max_batches=10 if args.smoke_test else None,
+            )
             score = float(val["lpips_after"] + val["dists_after"])
             val_row = {"step": step, **val, "score": score}
             csv_logger.log(val_row)
