@@ -35,10 +35,16 @@ nifi/
 ## 2. Install
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate nifi
+```
+
+If you are running CPU-only or macOS, remove `pytorch-cuda=12.1` from `environment.yml` before creating the environment.
+
+For existing environments, update in-place:
+
+```bash
+conda env update -f environment.yml --prune
 ```
 
 ## 3. Design Choices (Important)

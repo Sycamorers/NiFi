@@ -21,6 +21,8 @@ env/
 venv/
 .env
 .python-version
+.conda/
+conda-meta/
 
 # Jupyter
 .ipynb_checkpoints
