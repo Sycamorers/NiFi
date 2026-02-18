@@ -15,7 +15,7 @@ class DiffusionConfig:
     model_name_or_path: str
     num_train_timesteps: int = 1000
     lora_rank: int = 64
-    guidance_scale: float = 3.0
+    guidance_scale: float = 7.5
     prompt_dropout: float = 0.1
     max_token_length: int = 77
     vae_scaling_factor: float = 0.18215
@@ -74,10 +74,8 @@ class FrozenLDMWithNiFiAdapters(nn.Module):
     def vae_scale(self) -> float:
         return float(self.cfg.vae_scaling_factor)
 
-    def maybe_dropout_prompts(self, prompts: List[str], force_dropout: bool = False) -> List[str]:
-        if force_dropout:
-            return ["" for _ in prompts]
-        if self.cfg.prompt_dropout <= 0:
+    def maybe_dropout_prompts(self, prompts: List[str], apply_dropout: bool = True) -> List[str]:
+        if not apply_dropout or self.cfg.prompt_dropout <= 0:
             return prompts
 
         out = []
@@ -101,9 +99,17 @@ class FrozenLDMWithNiFiAdapters(nn.Module):
         hidden = self.text_encoder(**toks).last_hidden_state
         return hidden
 
-    def get_cfg_embeddings(self, prompts: List[str], train_mode: bool = True):
-        prompts = self.maybe_dropout_prompts(prompts, force_dropout=not train_mode)
-        cond = self.encode_prompt(prompts)
+    def get_cfg_embeddings(
+        self,
+        prompts: List[str],
+        train_mode: bool = True,
+        force_uncond: bool = False,
+    ):
+        if force_uncond:
+            cond_prompts = ["" for _ in prompts]
+        else:
+            cond_prompts = self.maybe_dropout_prompts(prompts, apply_dropout=train_mode)
+        cond = self.encode_prompt(cond_prompts)
         uncond = self.encode_prompt(["" for _ in prompts])
         return cond, uncond
 
@@ -145,9 +151,10 @@ class FrozenLDMWithNiFiAdapters(nn.Module):
         adapter_type: Optional[str] = None,
         guidance_scale: Optional[float] = None,
         train_mode: bool = True,
+        force_uncond: bool = False,
     ) -> torch.Tensor:
         g = float(self.cfg.guidance_scale if guidance_scale is None else guidance_scale)
-        cond_emb, uncond_emb = self.get_cfg_embeddings(prompts, train_mode=train_mode)
+        cond_emb, uncond_emb = self.get_cfg_embeddings(prompts, train_mode=train_mode, force_uncond=force_uncond)
 
         eps_uncond = self._unet_eps(latents, timesteps, uncond_emb)
         eps_cond = self._unet_eps(latents, timesteps, cond_emb)
@@ -186,5 +193,5 @@ class FrozenLDMWithNiFiAdapters(nn.Module):
         return self.schedule.q_sample(x, t, noise=noise)
 
     @staticmethod
-    def score_from_eps(eps: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        return SigmaSchedule.score_from_eps(eps, sigma)
+    def score_from_eps(x_t: torch.Tensor, eps: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        return SigmaSchedule.score_from_eps(x_t, eps, sigma)

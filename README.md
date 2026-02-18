@@ -60,16 +60,17 @@ conda env update -f environment.yml --prune
 - HAC++ upstream: `https://github.com/YihangChen-ee/HAC-plus`
 
 3. **Prompt conditioning**
-- Repro-lite uses empty prompts by default (unconditional path), but still keeps CFG and prompt dropout logic (`prompt_dropout` in config).
+- Repro-lite uses empty prompts by default, but will use scene-level prompts if present at `pairs/<scene>/prompt.txt` or `pairs/<scene>/prompt.json`.
+- CFG and prompt dropout logic (`prompt_dropout` in config) are enabled during training.
 
 4. **NiFi mechanics implemented**
 - Forward diffusion: `x_t = (1 - sigma_t) x + sigma_t eps`
 - One-step restoration: `x_hat = x_tilde_t0 - sigma_t0 * eps_{theta,phi-}(x_tilde_t0, t0)`
-- Distillation surrogate from score difference: `(s_restore - s_real)`
+- Score proxy aligned with paper Eq. 4: `s(x_t) = x_t - sigma_t * eps`
 - Alternating updates:
-  - update `phi_minus`: KL surrogate + GT guidance + L2 + LPIPS + DISTS
+  - update `phi_minus`: KL surrogate + real-score guidance + L2 + LPIPS (`DISTS` optional via weight)
   - update `phi_plus`: diffusion noise prediction MSE on restored latents
-- Default `t0=199`, LoRA rank `64`, `alpha=0.7` in config.
+- Default `t0=199`, LoRA rank `64`, `alpha=0.7`, guidance scale `7.5`, and paper-matched optimizer defaults in config.
 
 ## 4. Data Download
 

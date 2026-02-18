@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 
 from nifi.data import build_paired_dataloader
 from nifi.diffusion import DiffusionConfig, FrozenLDMWithNiFiAdapters
-from nifi.losses import ReconstructionLossBundle, gt_guidance_loss, kl_score_surrogate_loss
+from nifi.losses import ReconstructionLossBundle, kl_score_surrogate_loss, score_guidance_surrogate_loss
 from nifi.metrics import PerceptualMetrics
 from nifi.utils.checkpoint import load_checkpoint, save_checkpoint
 from nifi.utils.config import load_config
@@ -279,6 +279,7 @@ def main() -> None:
         clean = batch["clean"].to(device, non_blocking=non_blocking)
         degraded = batch["degraded"].to(device, non_blocking=non_blocking)
         prompts = list(batch["prompt"])
+        prompts_train = model.maybe_dropout_prompts(prompts, apply_dropout=True)
 
         assert_shape("clean", clean, 4)
         assert_shape("degraded", degraded, 4)
@@ -291,23 +292,26 @@ def main() -> None:
             z_deg = model.encode_images(degraded)
 
             z_tilde_t0, _ = model.q_sample(z_deg, t0_t)
-            eps_minus = model.predict_eps(z_tilde_t0, t0_t, prompts, adapter_type="minus", train_mode=True)
+            eps_minus = model.predict_eps(z_tilde_t0, t0_t, prompts_train, adapter_type="minus", train_mode=False)
 
             sigma0 = model.sigma(t0_t).view(-1, 1, 1, 1)
             z_hat = z_tilde_t0 - sigma0 * eps_minus
 
             t_dist = torch.randint(0, model_cfg.num_train_timesteps, (bsz,), device=device, dtype=torch.long)
-            z_hat_t, _ = model.q_sample(z_hat, t_dist)
-
-            eps_real = model.predict_eps(z_hat_t, t_dist, prompts, adapter_type=None, train_mode=False)
-            eps_restore = model.predict_eps(z_hat_t, t_dist, prompts, adapter_type="plus", train_mode=False)
-
+            z_hat_t, noise_dist = model.q_sample(z_hat, t_dist)
             sigma_dist = model.sigma(t_dist).view(-1, 1, 1, 1)
-            s_real = model.score_from_eps(eps_real, sigma_dist)
-            s_restore = model.score_from_eps(eps_restore, sigma_dist)
+            z_clean_t = (1.0 - sigma_dist) * z_clean + sigma_dist * noise_dist
 
-            loss_kl = kl_score_surrogate_loss(z_hat, s_real, s_restore)
-            loss_gt = gt_guidance_loss(eps_minus, z_tilde_t0, z_clean, sigma0)
+            eps_real_hat = model.predict_eps(z_hat_t, t_dist, prompts_train, adapter_type=None, train_mode=False)
+            eps_restore = model.predict_eps(z_hat_t, t_dist, prompts_train, adapter_type="plus", train_mode=False)
+            eps_real_clean = model.predict_eps(z_clean_t, t_dist, prompts_train, adapter_type=None, train_mode=False)
+
+            s_real_hat = model.score_from_eps(z_hat_t, eps_real_hat, sigma_dist)
+            s_restore = model.score_from_eps(z_hat_t, eps_restore, sigma_dist)
+            s_real_clean = model.score_from_eps(z_clean_t, eps_real_clean, sigma_dist)
+
+            loss_kl = kl_score_surrogate_loss(z_hat, s_real_hat, s_restore)
+            loss_gt = score_guidance_surrogate_loss(z_hat, s_real_clean, s_real_hat)
 
             restored = model.decode_latents(z_hat)
 
@@ -344,7 +348,7 @@ def main() -> None:
             z_hat_det = z_hat.detach()
             t_plus = torch.randint(0, model_cfg.num_train_timesteps, (bsz,), device=device, dtype=torch.long)
             z_plus_t, noise_plus = model.q_sample(z_hat_det, t_plus)
-            eps_plus = model.predict_eps(z_plus_t, t_plus, prompts, adapter_type="plus", train_mode=True)
+            eps_plus = model.predict_eps(z_plus_t, t_plus, prompts_train, adapter_type="plus", train_mode=False)
             loss_plus = F.mse_loss(eps_plus, noise_plus)
 
         assert_no_nan("loss_plus", loss_plus)

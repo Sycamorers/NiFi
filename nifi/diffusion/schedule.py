@@ -34,6 +34,6 @@ class SigmaSchedule:
         return x_t, noise
 
     @staticmethod
-    def score_from_eps(eps: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        # Using score approximation under additive noise convention
-        return -eps / (sigma + 1e-6)
+    def score_from_eps(x_t: torch.Tensor, eps: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        # NiFi Eq.4 uses a denoised estimate as the score proxy.
+        return x_t - sigma * eps

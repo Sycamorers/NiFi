@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -56,6 +57,7 @@ class PairedImageDataset(Dataset):
 
         pairs: List[PairSample] = []
         for scene_dir in sorted([p for p in self.data_root.iterdir() if p.is_dir()]):
+            scene_prompt = self._read_scene_prompt(scene_dir)
             for rate_dir in sorted([p for p in scene_dir.iterdir() if p.is_dir()]):
                 if self.allowed_rates and rate_dir.name not in self.allowed_rates:
                     continue
@@ -76,7 +78,7 @@ class PairedImageDataset(Dataset):
                             name=clean_path.stem,
                             clean_path=clean_path,
                             degraded_path=degraded_path,
-                            prompt="",
+                            prompt=scene_prompt,
                         )
                     )
 
@@ -87,6 +89,30 @@ class PairedImageDataset(Dataset):
             )
 
         return pairs
+
+    @staticmethod
+    def _read_scene_prompt(scene_dir: Path) -> str:
+        txt_path = scene_dir / "prompt.txt"
+        if txt_path.exists():
+            try:
+                return txt_path.read_text().strip()
+            except Exception:
+                return ""
+
+        json_path = scene_dir / "prompt.json"
+        if json_path.exists():
+            try:
+                with json_path.open("r") as f:
+                    payload = json.load(f)
+                if isinstance(payload, dict):
+                    for key in ("prompt", "text", "caption"):
+                        value = payload.get(key)
+                        if isinstance(value, str):
+                            return value.strip()
+            except Exception:
+                return ""
+
+        return ""
 
     def __len__(self) -> int:
         return len(self.samples)
