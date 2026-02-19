@@ -1,0 +1,18 @@
+benchmark:
+  datasets:
+    - mipnerf360
+    - tanks_temples
+    - deepblending
+  rates:
+    - 0.1
+    - 0.5
+    - 1.0
+  metrics:
+    - lpips
+    - dists
+  split: test
+
+notes:
+  paper: arXiv:2602.04549
+  table: "Table 1"
+  restoration_equation: "Eq. 7"

@@ -1,113 +1,97 @@
-# NiFi Repro-Lite (PyTorch)
+# NiFi Reproduction (Third-Party Learning Project)
 
-Minimal end-to-end reproduction of **"Nix and Fix: Targeting 1000× Compression of 3D Gaussian Splatting with Diffusion Models"** with:
+Original paper:
+- **Nix and Fix: Targeting 1000x Compression of 3D Gaussian Splatting with Diffusion Models**
+- arXiv: https://arxiv.org/abs/2602.04549
 
-- artifact synthesis from clean views to degraded views (compression proxy + optional HAC++ hook)
-- one-step latent diffusion restoration at intermediate timestep `t0`
-- two LoRA-style adapters on a frozen latent diffusion backbone:
-  - `phi_minus`: restoration adapter
-  - `phi_plus`: critic adapter for distribution matching distillation
-- alternating optimization (`phi_minus` then `phi_plus`)
-- perceptual metrics: **LPIPS + DISTS**
-- smoke-test mode (1 scene, 10 images, 100 steps)
+Disclaimer:
+- This repository is an independent third-party implementation for learning and experimentation.
 
-This is a **repro-lite** implementation. It preserves NiFi training mechanics while using a practical diffusion substitution and a lightweight compression pipeline by default.
+This repository is refactored so the code structure follows the paper workflow:
+- Artifact Synthesis
+- Artifact Restoration
+- Restoration Distribution Matching
+- Perceptual Matching
+- Benchmark Evaluation
 
-## 1. Repository Layout
+## 1. Environment Setup
 
-```
-configs/default.yaml
-scripts/
-  download_data.py
-  build_3dgs_and_compress.py
-  render_pairs.py
-  train_nifi.py
-  eval_nifi.py
-nifi/
-  data/
-  gs/
-  diffusion/
-  losses/
-  metrics/
-  utils/
-```
+### Python version
+- `Python 3.11`
 
-## 2. Install
-
+### Conda setup
 ```bash
 conda env create -f environment.yml
 conda activate nifi
 ```
 
-If you are running CPU-only or macOS, remove `pytorch-cuda=12.1` from `environment.yml` before creating the environment.
-
-For existing environments, update in-place:
-
+### Pip setup (alternative)
 ```bash
-conda env update -f environment.yml --prune
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## 3. Design Choices (Important)
+## 2. Repository Structure
 
-1. **Diffusion backbone substitution**
-- Paper uses SD3 backbone.
-- This repro defaults to `hf-internal-testing/tiny-stable-diffusion-torch` for fast verification.
-- For closer fidelity, set `model.pretrained_model_name_or_path` in `configs/default.yaml` to SD1.5/2.1-compatible weights.
+```text
+configs/
+  default.yaml
 
-2. **3DGS compression backend**
-- Default: `proxy` artifact synthesizer (prune/quantization-like degradations via downsampling, quantization, JPEG, blur).
-- Optional: HAC++ wrapper hooks provided in `scripts/build_3dgs_and_compress.py` (`--method hacpp`).
-- HAC++ upstream: `https://github.com/YihangChen-ee/HAC-plus`
+nifi/
+  artifact_synthesis/
+  artifact_restoration/
+  restoration_distribution_matching/
+  perceptual_matching/
+  benchmark/
 
-3. **Prompt conditioning**
-- Repro-lite uses empty prompts by default, but will use scene-level prompts if present at `pairs/<scene>/prompt.txt` or `pairs/<scene>/prompt.json`.
-- CFG and prompt dropout logic (`prompt_dropout` in config) are enabled during training.
+scripts/
+  download_data.py
+  download_benchmark_data.py
+  build_3dgs_and_compress.py
+  render_pairs.py
+  prepare_benchmark_pairs.py
+  train_nifi.py
+  eval_nifi.py
+  eval_benchmark_nifi.py
+  verify_paper_implementation.py
 
-4. **NiFi mechanics implemented**
-- Forward diffusion: `x_t = (1 - sigma_t) x + sigma_t eps`
-- One-step restoration: `x_hat = x_tilde_t0 - sigma_t0 * eps_{theta,phi-}(x_tilde_t0, t0)`
-- Score proxy aligned with paper Eq. 4: `s(x_t) = x_t - sigma_t * eps`
-- Alternating updates:
-  - update `phi_minus`: KL surrogate + real-score guidance + L2 + LPIPS (`DISTS` optional via weight)
-  - update `phi_plus`: diffusion noise prediction MSE on restored latents
-- Default `t0=199`, LoRA rank `64`, `alpha=0.7`, guidance scale `7.5`, and paper-matched optimizer defaults in config.
-
-## 4. Data Download
-
-### Mip-NeRF360 (real dataset)
-
-Default downloads one scene (`garden`) from official GCS-hosted Mip-NeRF360 files.
-
-```bash
-python scripts/download_data.py --dataset mipnerf360 --out data/
+docs/
+  workflow_module_mapping.md
+  equation_to_code_mapping.md
+  implementation_verification.md
 ```
 
-Useful options:
+## 3. Dataset Preparation
 
+## 3.1 Training data (DL3DV scenes)
+The paper trains on DL3DV scenes. If you already have a local subset:
 ```bash
-# multiple scenes
-python scripts/download_data.py --dataset mipnerf360 --out data/ --scenes garden bicycle
-
-# create an images_tiny folder with first N images for quick debugging
-python scripts/download_data.py --dataset mipnerf360 --out data/ --scenes garden --max_images 10
+python scripts/download_data.py \
+  --dataset dl3dv \
+  --out data/ \
+  --dl3dv_source /path/to/local/dl3dv_subset
 ```
 
-Notes:
-- Scene zips are large (GB scale).
-- `download_data.py` prepares `data/mipnerf360/<scene>/...`.
-
-### DL3DV support
-
-Manual subset copy is supported:
-
+## 3.2 Benchmark datasets (Sec. 4.2)
+Download paper evaluation datasets:
 ```bash
-python scripts/download_data.py --dataset dl3dv --out data/ --dl3dv_source /path/to/local/dl3dv_subset
+python scripts/download_benchmark_data.py \
+  --dataset all \
+  --out data/benchmarks
 ```
 
-## 5. Artifact Synthesis + Pair Rendering
+Optional Mip-NeRF360 subset:
+```bash
+python scripts/download_benchmark_data.py \
+  --dataset mipnerf360 \
+  --out data/benchmarks \
+  --mip_scenes garden bicycle kitchen
+```
 
-### Build 3DGS/compression artifacts
+## 4. Preprocessing Pipeline
 
+## 4.1 Artifact synthesis (clean + degraded renders)
 ```bash
 python scripts/build_3dgs_and_compress.py \
   --scene data/mipnerf360/garden \
@@ -115,18 +99,7 @@ python scripts/build_3dgs_and_compress.py \
   --out artifacts/garden/
 ```
 
-Optional tiny artifact generation:
-
-```bash
-python scripts/build_3dgs_and_compress.py \
-  --scene data/mipnerf360/garden \
-  --rates 0.1 0.5 1.0 \
-  --max_images 10 \
-  --out artifacts/garden/
-```
-
-### Render aligned clean/degraded pairs
-
+## 4.2 Build pair layout for train/eval
 ```bash
 python scripts/render_pairs.py \
   --scene artifacts/garden/ \
@@ -139,43 +112,128 @@ python scripts/render_pairs.py \
   --out pairs/garden/
 ```
 
-`render_pairs.py` normalizes output roots, so both `pairs/<scene>/` and `pairs/<scene>/train/` forms are accepted.
-
-This produces:
-
-```
-pairs/garden/rate_0.100/train/{clean,degraded}
-pairs/garden/rate_0.500/train/{clean,degraded}
-pairs/garden/rate_1.000/train/{clean,degraded}
-...
+Output layout:
+```text
+pairs/<scene>/rate_<lambda>/<split>/clean/*.png
+pairs/<scene>/rate_<lambda>/<split>/degraded/*.png
 ```
 
-## 6. Train
+## 4.3 Benchmark pair preprocessing
+Proxy compression mode:
+```bash
+python scripts/prepare_benchmark_pairs.py \
+  --dataset mipnerf360 \
+  --dataset_root data/benchmarks/mipnerf360 \
+  --out pairs/benchmarks \
+  --rates 0.1 0.5 1.0 \
+  --compression_method proxy
+```
 
+Precomputed HAC++ mode:
+```bash
+python scripts/prepare_benchmark_pairs.py \
+  --dataset tanks_temples \
+  --dataset_root data/benchmarks/tanks_temples \
+  --out pairs/benchmarks \
+  --rates 0.1 0.5 1.0 \
+  --compression_method precomputed \
+  --compressed_root /path/to/hacpp/renders
+```
+
+## 5. Training
+
+Exact command:
 ```bash
 python scripts/train_nifi.py \
   --config configs/default.yaml \
   --data_root pairs/ \
-  --exp runs/nifi_tiny
+  --exp runs/nifi_train
 ```
 
-### Single GPU (RTX 3090, 24GB) runtime
+### Paper-matched hyperparameters in `configs/default.yaml`
+- `model.guidance_scale: 7.5`
+- `model.lora_rank: 64`
+- `diffusion.t0: 199`
+- `train.batch_size: 4`
+- `train.max_steps: 60000`
+- `train.lr_phi_minus: 5e-6`
+- `train.lr_phi_plus: 1e-6`
+- `train.weight_decay: 1e-4`
+- `train.grad_clip: 1.0`
+- `loss_weights.alpha: 0.7`
+- `model.prompt_dropout: 0.1`
 
-- `configs/default.yaml` now includes a `runtime` block for GPU behavior:
-  - `device: cuda`, `device_id: 0`
-  - `mixed_precision: fp16`
-  - `allow_tf32: true`, `cudnn_benchmark: true`
-  - pinned/non-blocking dataloader transfer enabled
-- To force one GPU explicitly:
+Training outputs:
+- `runs/<exp>/latest.pt`
+- `runs/<exp>/best.pt`
+- `runs/<exp>/train_log.csv`
+- `runs/<exp>/train_summary.json`
 
+## 6. Evaluation
+
+## 6.1 Pair-root evaluation
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/train_nifi.py \
-  --config configs/default.yaml \
+python scripts/eval_nifi.py \
+  --ckpt runs/nifi_train/best.pt \
   --data_root pairs/ \
-  --exp runs/nifi_3090
+  --split test \
+  --out runs/nifi_train/metrics.json
 ```
 
-### Smoke test (requested minimal verification path)
+Expected output format (`metrics.json`):
+- `metrics.aggregate.lpips_before`
+- `metrics.aggregate.lpips_after`
+- `metrics.aggregate.dists_before`
+- `metrics.aggregate.dists_after`
+- `records[]` with per-image metrics
+
+## 6.2 Benchmark protocol evaluation (Sec. 4.2)
+```bash
+python scripts/eval_benchmark_nifi.py \
+  --ckpt runs/nifi_train/best.pt \
+  --data_root pairs/benchmarks \
+  --split test \
+  --out runs/nifi_train/benchmark_metrics.json
+```
+
+Expected output format (`benchmark_metrics.json`):
+- `summary.aggregate`
+- `summary.per_dataset`
+- `summary.per_dataset_rate`
+- `summary.per_scene`
+- `paper_comparison` (delta vs paper Table 1 NiFi numbers)
+
+## 7. Reproducing Paper Results
+
+Paper reports LPIPS/DISTS for NiFi at three rates (`lambda in {0.1, 0.5, 1.0}`):
+
+- Mip-NeRF360: `0.178/0.109`, `0.235/0.133`, `0.265/0.153`
+- Tanks & Temples: `0.128/0.076`, `0.180/0.095`, `0.212/0.109`
+- DeepBlending: `0.133/0.101`, `0.180/0.131`, `0.218/0.156`
+
+### Important deviation notes
+Exact paper-level matching can deviate if any of these differ:
+- Paper uses SD3 backbone; default config uses a lightweight SD-compatible model for practicality.
+- Paper uses HAC++ low-rate compressed renders; proxy compression is used unless precomputed HAC++ outputs are supplied.
+- Paper uses Qwen2.5-VL prompt extraction; this repo supports prompt files but not full automatic prompt generation workflow.
+
+## 8. Formula-to-Code and Verification Docs
+
+- Workflow mapping: `docs/workflow_module_mapping.md`
+- Equation mapping: `docs/equation_to_code_mapping.md`
+- Verification report: `docs/implementation_verification.md`
+
+Run equation verification:
+```bash
+python scripts/verify_paper_implementation.py
+```
+
+Run unit tests:
+```bash
+python -m pytest -q tests/test_paper_alignment.py
+```
+
+## 9. One-Command Minimal Smoke Path
 
 ```bash
 python scripts/train_nifi.py \
@@ -184,82 +242,3 @@ python scripts/train_nifi.py \
   --exp runs/nifi_smoke \
   --smoke_test
 ```
-
-Smoke mode uses config defaults of roughly:
-- 10 images
-- 100 steps
-- fast eval subset
-
-Training outputs:
-- `runs/<exp>/latest.pt`
-- `runs/<exp>/best.pt`
-- `runs/<exp>/train_log.csv`
-- `runs/<exp>/train_summary.json`
-
-## 7. Evaluate (LPIPS + DISTS)
-
-```bash
-python scripts/eval_nifi.py \
-  --ckpt runs/nifi_tiny/best.pt \
-  --data_root pairs/ \
-  --split test \
-  --out runs/nifi_tiny/metrics.json
-```
-
-Output files:
-- JSON: per-image, per-scene, aggregate metrics
-- CSV: flat per-image table with LPIPS/DISTS before and after restoration
-
-## 8. Expected Commands (from task)
-
-```bash
-python scripts/download_data.py --dataset mipnerf360 --out data/
-python scripts/build_3dgs_and_compress.py --scene data/mipnerf360/<scene> --rates 0.1 0.5 1.0 --out artifacts/<scene>/
-python scripts/render_pairs.py --scene artifacts/<scene>/ --split train --out pairs/<scene>/train/
-python scripts/train_nifi.py --config configs/default.yaml --data_root pairs/ --exp runs/nifi_tiny
-python scripts/eval_nifi.py --ckpt runs/nifi_tiny/best.pt --data_root pairs/ --split test --out runs/nifi_tiny/metrics.json
-```
-
-## 8.1 Self-test (Auto Diagnostics + Auto Fallback)
-
-Run one command to execute build -> pair rendering -> metrics with hang detection, diagnostics, and retries:
-
-```bash
-python scripts/selftest_pipeline.py \
-  --scene data/mipnerf360/garden \
-  --out artifacts/garden_selftest \
-  --rates 0.5 \
-  --smoke
-```
-
-What success looks like:
-- Console ends with `PASS`
-- `artifacts/garden_selftest/` contains:
-  - `run_manifest.json` (stage timings + environment + artifacts)
-  - `selftest_manifest.json` (step retries + final assertions)
-  - `logs/*.log` (captured subprocess output)
-  - at least one readable `.png`
-  - `metrics.json` and `metrics.csv` with numeric metrics
-
-If any step hangs (>60s no output) or times out, diagnostics are auto-dumped:
-- process tree
-- CPU/memory snapshot
-- GPU utilization/VRAM snapshot
-- recent output file writes
-- best-effort Python stack traces via `SIGUSR1` + `faulthandler`
-
-## 9. Robustness Features
-
-- deterministic seeds (`nifi/utils/seed.py`)
-- checkpoint save/resume (`nifi/utils/checkpoint.py`)
-- fp16/bf16 autocast support
-- optimized single-GPU runtime controls (`runtime` block in `configs/default.yaml`)
-- gradient clipping
-- NaN/Inf checks + tensor shape checks
-- tiny overfit sanity guard (start/end loss trend)
-
-## 10. Known Limitations
-
-- Default compressor is a practical proxy, not full HAC++ unless externally configured.
-- Default diffusion model is tiny for reproducibility; quality is lower than SD1.5/SD3-scale backbones.
-- Mip-NeRF360 downloads are large.

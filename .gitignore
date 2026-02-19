@@ -37,3 +37,6 @@ Thumbs.db
 
 # Git LFS metadata
 .gitattributes
+
+# Local paper copy (large and not needed for code push)
+/nifi.pdf

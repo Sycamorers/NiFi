@@ -15,9 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from nifi.data import build_paired_dataloader
-from nifi.diffusion import DiffusionConfig, FrozenLDMWithNiFiAdapters
-from nifi.metrics import PerceptualMetrics, aggregate_scene_metrics
+from nifi.artifact_restoration import (
+    ArtifactRestorationDiffusionConfig,
+    FrozenBackboneArtifactRestorationModel,
+    artifact_restoration_one_step_eq7,
+)
+from nifi.artifact_synthesis import build_artifact_pair_dataloader
+from nifi.perceptual_matching import PerceptualMatchingMetrics, aggregate_scene_metrics
 from nifi.utils.checkpoint import load_checkpoint
 from nifi.utils.config import load_config
 from nifi.utils.logging import get_logger
@@ -56,22 +60,6 @@ def save_csv(path: Path, rows: List[Dict[str, object]]) -> None:
 
 
 
-def restore_one_step(
-    model: FrozenLDMWithNiFiAdapters,
-    z_degraded: torch.Tensor,
-    prompts,
-    t0: int,
-):
-    b = z_degraded.shape[0]
-    t0_t = torch.full((b,), t0, device=z_degraded.device, dtype=torch.long)
-    z_tilde_t0, _ = model.q_sample(z_degraded, t0_t, noise=torch.zeros_like(z_degraded))
-    eps_minus = model.predict_eps(z_tilde_t0, t0_t, prompts, adapter_type="minus", train_mode=False)
-    sigma0 = model.sigma(t0_t).view(-1, 1, 1, 1)
-    z_hat = z_tilde_t0 - sigma0 * eps_minus
-    return z_hat
-
-
-
 def main() -> None:
     args = parse_args()
     logger = get_logger("nifi.eval")
@@ -107,7 +95,7 @@ def main() -> None:
     amp_dtype = torch.bfloat16 if mp == "bf16" else torch.float16
     use_amp = device.type == "cuda" and mp in {"bf16", "fp16"}
 
-    model_cfg = DiffusionConfig(
+    model_cfg = ArtifactRestorationDiffusionConfig(
         model_name_or_path=cfg["model"]["pretrained_model_name_or_path"],
         num_train_timesteps=int(cfg["diffusion"]["num_train_timesteps"]),
         lora_rank=int(cfg["model"]["lora_rank"]),
@@ -117,14 +105,14 @@ def main() -> None:
         vae_scaling_factor=float(cfg["model"]["vae_scaling_factor"]),
     )
 
-    model = FrozenLDMWithNiFiAdapters(model_cfg, device=device, dtype=amp_dtype if use_amp else torch.float32)
+    model = FrozenBackboneArtifactRestorationModel(model_cfg, device=device, dtype=amp_dtype if use_amp else torch.float32)
     model.phi_minus.load_state_dict(ckpt["phi_minus"])
     model.phi_plus.load_state_dict(ckpt["phi_plus"])
     model.freeze_backbone()
     model.eval()
 
     image_size = int(cfg.get("image_size", 256) or 256)
-    dl = build_paired_dataloader(
+    dl = build_artifact_pair_dataloader(
         data_root=args.data_root,
         split=args.split,
         image_size=image_size,
@@ -138,7 +126,7 @@ def main() -> None:
         prefetch_factor=int(runtime_cfg.get("prefetch_factor", 4)),
     )
 
-    metrics = PerceptualMetrics(device=device)
+    metrics = PerceptualMatchingMetrics(device=device)
     t0 = int(cfg["diffusion"]["num_train_timesteps"] - 1) if cfg["diffusion"].get("t_ablation_full", False) else int(cfg["diffusion"]["t0"])
 
     records: List[Dict[str, object]] = []
@@ -159,7 +147,7 @@ def main() -> None:
 
         with torch.no_grad(), autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             z_deg = model.encode_images(degraded)
-            z_hat = restore_one_step(model, z_deg, prompts, t0=t0)
+            z_hat = artifact_restoration_one_step_eq7(model, z_deg, prompts, t0=t0, stochastic=False)
             restored = model.decode_latents(z_hat)
 
             lp_before = metrics.lpips(degraded.float(), clean.float())

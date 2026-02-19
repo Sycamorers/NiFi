@@ -19,7 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from nifi.gs import CompressionConfig, HACPPWrapper, Proxy3DGSCompressor, list_scene_images
+from nifi.artifact_synthesis import (
+    ArtifactSynthesisCompressionConfig,
+    HACPPArtifactSynthesisWrapper,
+    ProxyArtifactSynthesisCompressor,
+    list_scene_images,
+)
 from nifi.utils.diagnostics import (
     collect_diagnostics,
     dump_stack_traces,
@@ -428,13 +433,13 @@ def stage_compress(args: argparse.Namespace, state: Dict[str, Any], progress: St
         return
 
     if args.method == "proxy":
-        cfg = CompressionConfig(
+        cfg = ArtifactSynthesisCompressionConfig(
             jpeg_quality_min=int(args.jpeg_quality_min),
             jpeg_quality_max=int(args.jpeg_quality_max),
             downsample_min=int(args.downsample_min),
             downsample_max=int(args.downsample_max),
         )
-        compressor = Proxy3DGSCompressor(cfg)
+        compressor = ProxyArtifactSynthesisCompressor(cfg)
 
         progress.update(total=len(rates), done=0, substep="create_rate_dirs")
         for i, rate in enumerate(rates, start=1):
@@ -454,7 +459,7 @@ def stage_compress(args: argparse.Namespace, state: Dict[str, Any], progress: St
 
     # HAC++ path: execute external train+compress wrapper.
     progress.update(total=1, done=0, substep="hacpp_wrapper_run")
-    wrapper = HACPPWrapper(Path(args.hacpp_repo))
+    wrapper = HACPPArtifactSynthesisWrapper(Path(args.hacpp_repo))
     wrapper.run(
         scene_dir=Path(args.scene),
         out_dir=Path(args.out),
@@ -501,7 +506,7 @@ def stage_render_degraded(args: argparse.Namespace, state: Dict[str, Any], progr
         progress.update(done=done, total=total, substep=f"clean_view_{i+1}/{len(selected)}")
 
     # Stage 2: produce degraded views per compression rate.
-    compressor: Optional[Proxy3DGSCompressor] = state.get("compressor", None)
+    compressor: Optional[ProxyArtifactSynthesisCompressor] = state.get("compressor", None)
     skip_compress = bool(args.skip_compress)
 
     for r_idx, rate in enumerate(rates, start=1):
@@ -515,7 +520,7 @@ def stage_render_degraded(args: argparse.Namespace, state: Dict[str, Any], progr
                 if skip_compress or compressor is None:
                     degraded = clean_rgb.copy()
                 else:
-                    degraded = compressor.degrade_image(clean_rgb, float(rate))
+                    degraded = compressor.synthesize_view_artifact(clean_rgb, float(rate))
                 degraded.save(rate_dir / name)
 
             done += 1

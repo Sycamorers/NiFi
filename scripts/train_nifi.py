@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Dict, Iterator
 
 import torch
-import torch.nn.functional as F
 from torch import autocast
 from torch.cuda.amp import GradScaler
 from tqdm import tqdm
@@ -17,10 +16,19 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from nifi.data import build_paired_dataloader
-from nifi.diffusion import DiffusionConfig, FrozenLDMWithNiFiAdapters
-from nifi.losses import ReconstructionLossBundle, kl_score_surrogate_loss, score_guidance_surrogate_loss
-from nifi.metrics import PerceptualMetrics
+from nifi.artifact_restoration import (
+    ArtifactRestorationDiffusionConfig,
+    FrozenBackboneArtifactRestorationModel,
+    artifact_restoration_one_step_eq7,
+)
+from nifi.artifact_synthesis import build_artifact_pair_dataloader
+from nifi.perceptual_matching import PerceptualMatchingLossBundle, PerceptualMatchingMetrics
+from nifi.restoration_distribution_matching import (
+    ground_truth_direction_surrogate_eq5,
+    kl_divergence_surrogate_eq4,
+    phi_minus_objective_eq6,
+    phi_plus_diffusion_objective_eq8,
+)
 from nifi.utils.checkpoint import load_checkpoint, save_checkpoint
 from nifi.utils.config import load_config
 from nifi.utils.logging import CSVLogger, dump_json, get_logger
@@ -60,31 +68,10 @@ def pick_dtype(mixed_precision: str) -> torch.dtype:
 
 
 
-def restore_latents_one_step(
-    model: FrozenLDMWithNiFiAdapters,
-    z_degraded: torch.Tensor,
-    prompts,
-    t0: int,
-    stochastic: bool,
-) -> torch.Tensor:
-    b = z_degraded.shape[0]
-    device = z_degraded.device
-    t0_t = torch.full((b,), t0, device=device, dtype=torch.long)
-
-    noise = torch.randn_like(z_degraded) if stochastic else torch.zeros_like(z_degraded)
-    z_tilde_t0, _ = model.q_sample(z_degraded, t0_t, noise=noise)
-
-    eps_minus = model.predict_eps(z_tilde_t0, t0_t, prompts, adapter_type="minus", train_mode=stochastic)
-    sigma0 = model.sigma(t0_t).view(-1, 1, 1, 1)
-    z_hat = z_tilde_t0 - sigma0 * eps_minus
-    return z_hat
-
-
-
 def evaluate(
-    model: FrozenLDMWithNiFiAdapters,
+    model: FrozenBackboneArtifactRestorationModel,
     val_loader,
-    metrics: PerceptualMetrics,
+    metrics: PerceptualMatchingMetrics,
     device: torch.device,
     t0: int,
     non_blocking: bool,
@@ -108,7 +95,7 @@ def evaluate(
 
         with torch.no_grad(), autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             z_deg = model.encode_images(degraded)
-            z_hat = restore_latents_one_step(model, z_deg, prompts, t0=t0, stochastic=False)
+            z_hat = artifact_restoration_one_step_eq7(model, z_deg, prompts, t0=t0, stochastic=False)
             restored = model.decode_latents(z_hat)
 
             lp_b = metrics.lpips(degraded.float(), clean.float())
@@ -182,7 +169,7 @@ def main() -> None:
 
     rates = cfg.get("rates", None)
 
-    train_loader = build_paired_dataloader(
+    train_loader = build_artifact_pair_dataloader(
         data_root=args.data_root,
         split="train",
         image_size=image_size,
@@ -196,7 +183,7 @@ def main() -> None:
         prefetch_factor=int(runtime_cfg.get("prefetch_factor", 4)),
     )
 
-    val_loader = build_paired_dataloader(
+    val_loader = build_artifact_pair_dataloader(
         data_root=args.data_root,
         split="test",
         image_size=image_size,
@@ -210,7 +197,7 @@ def main() -> None:
         prefetch_factor=int(runtime_cfg.get("prefetch_factor", 4)),
     )
 
-    model_cfg = DiffusionConfig(
+    model_cfg = ArtifactRestorationDiffusionConfig(
         model_name_or_path=cfg["model"]["pretrained_model_name_or_path"],
         num_train_timesteps=int(cfg["diffusion"]["num_train_timesteps"]),
         lora_rank=int(cfg["model"]["lora_rank"]),
@@ -219,14 +206,14 @@ def main() -> None:
         max_token_length=int(cfg["model"]["max_token_length"]),
         vae_scaling_factor=float(cfg["model"]["vae_scaling_factor"]),
     )
-    model = FrozenLDMWithNiFiAdapters(model_cfg, device=device, dtype=amp_dtype if use_amp else torch.float32)
+    model = FrozenBackboneArtifactRestorationModel(model_cfg, device=device, dtype=amp_dtype if use_amp else torch.float32)
     model.freeze_backbone()
 
-    rec_losses = ReconstructionLossBundle().to(device)
+    rec_losses = PerceptualMatchingLossBundle().to(device)
     rec_losses.eval()
     for p in rec_losses.parameters():
         p.requires_grad_(False)
-    eval_metrics = PerceptualMetrics(device=device)
+    eval_metrics = PerceptualMatchingMetrics(device=device)
 
     opt_minus = torch.optim.AdamW(
         model.adapter_parameters("minus"),
@@ -310,19 +297,25 @@ def main() -> None:
             s_restore = model.score_from_eps(z_hat_t, eps_restore, sigma_dist)
             s_real_clean = model.score_from_eps(z_clean_t, eps_real_clean, sigma_dist)
 
-            loss_kl = kl_score_surrogate_loss(z_hat, s_real_hat, s_restore)
-            loss_gt = score_guidance_surrogate_loss(z_hat, s_real_clean, s_real_hat)
+            loss_kl = kl_divergence_surrogate_eq4(z_hat, s_real_hat, s_restore)
+            loss_gt = ground_truth_direction_surrogate_eq5(z_hat, s_real_clean, s_real_hat)
 
             restored = model.decode_latents(z_hat)
 
         rec = rec_losses(clean.float(), restored.float())
 
-        total_minus = (
-            float(loss_w["alpha"]) * float(loss_w["kl"]) * loss_kl
-            + (1.0 - float(loss_w["alpha"])) * float(loss_w["gt"]) * loss_gt
-            + float(loss_w["l2"]) * rec["l2"]
-            + float(loss_w["lpips"]) * rec["lpips"]
-            + float(loss_w["dists"]) * rec["dists"]
+        total_minus = phi_minus_objective_eq6(
+            alpha=float(loss_w["alpha"]),
+            kl_term=loss_kl,
+            gt_term=loss_gt,
+            l2_term=rec["l2"],
+            lpips_term=rec["lpips"],
+            dists_term=rec["dists"],
+            weight_kl=float(loss_w["kl"]),
+            weight_gt=float(loss_w["gt"]),
+            weight_l2=float(loss_w["l2"]),
+            weight_lpips=float(loss_w["lpips"]),
+            weight_dists=float(loss_w["dists"]),
         )
 
         assert_no_nan("total_minus", total_minus)
@@ -349,7 +342,7 @@ def main() -> None:
             t_plus = torch.randint(0, model_cfg.num_train_timesteps, (bsz,), device=device, dtype=torch.long)
             z_plus_t, noise_plus = model.q_sample(z_hat_det, t_plus)
             eps_plus = model.predict_eps(z_plus_t, t_plus, prompts_train, adapter_type="plus", train_mode=False)
-            loss_plus = F.mse_loss(eps_plus, noise_plus)
+            loss_plus = phi_plus_diffusion_objective_eq8(eps_plus, noise_plus)
 
         assert_no_nan("loss_plus", loss_plus)
         scaled_plus = loss_plus / grad_accum
